@@ -1,19 +1,19 @@
 from fastapi import FastAPI, Depends, HTTPException, status, Form, Request
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy.orm import Session
-from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, relationship
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, ForeignKey
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.declarative import declarative_base
 from jose import JWTError, jwt
 from msal import ConfidentialClientApplication  # Microsoft login
 from google.oauth2 import id_token  # Google login
 from google.auth.transport import requests  # Google login
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from dotenv import load_dotenv
 import uuid
 import os
 import requests as external_requests
-from app import models, database, utils
 
 # Load environment variables
 load_dotenv()
@@ -27,7 +27,7 @@ MICROSOFT_TENANT_ID = os.getenv("MICROSOFT_TENANT_ID")
 MICROSOFT_AUTHORITY = f"https://login.microsoftonline.com/{MICROSOFT_TENANT_ID}"
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
-SECRET_KEY = os.getenv("SECRET_KEY")
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")  # Replace with your own secret key
 ALGORITHM = "HS256"
 
 # Redirect URIs
@@ -35,17 +35,120 @@ REDIRECT_URI = "http://localhost:8000/auth/callback"
 GOOGLE_REDIRECT_URI = "http://localhost:8000/auth/google/callback"
 SCOPES = ["User.Read"]
 
+# Database setup
+DATABASE_URL = "sqlite:///./test.db"  # Replace with your database URL
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+Base = declarative_base()
+
+# Models
+
+class Tenant(Base):
+    __tablename__ = "tenants"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True)
+    users = relationship("User", back_populates="tenant")
+    organizations = relationship("Organization", back_populates="tenant")
+    apps = relationship("AppSubscription", back_populates="tenant")
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    first_name = Column(String)
+    last_name = Column(String)
+    user_name = Column(String, unique=True, index=True, nullable=True)
+    email = Column(String, unique=True, index=True)
+    phone = Column(String, nullable=True)
+    time_zone = Column(String, nullable=True)
+    scope = Column(String, nullable=True)
+    about_us = Column(String, nullable=True)
+    is_active = Column(Boolean, default=True)
+    registration_token = Column(String, nullable=True)
+    type = Column(String, default="ActionUser")  # Admin, Tenant, ActionUser
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=True)
+    tenant = relationship("Tenant", back_populates="users")
+    roles = relationship("UserRole", back_populates="user")
+    organizations = relationship("Organization", back_populates="contact_person")
+
+class Role(Base):
+    __tablename__ = "roles"
+    id = Column(Integer, primary_key=True, index=True)
+    role_name = Column(String, unique=True)
+    user_roles = relationship("UserRole", back_populates="role")
+
+class UserRole(Base):
+    __tablename__ = "user_roles"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    role_id = Column(Integer, ForeignKey("roles.id"))
+    user = relationship("User", back_populates="roles")
+    role = relationship("Role", back_populates="user_roles")
+
+class Organization(Base):
+    __tablename__ = "organizations"
+    id = Column(Integer, primary_key=True, index=True)
+    legal_name = Column(String)
+    address = Column(String)
+    neighborhood = Column(String)
+    city = Column(String)
+    state = Column(String)
+    country = Column(String)
+    postal_code = Column(String)
+    time_zone = Column(String)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"))
+    tenant = relationship("Tenant", back_populates="organizations")
+    contact_person_id = Column(Integer, ForeignKey("users.id"))
+    contact_person = relationship("User", back_populates="organizations")
+
+class App(Base):
+    __tablename__ = "apps"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True)
+    subscriptions = relationship("AppSubscription", back_populates="app")
+
+class AppSubscription(Base):
+    __tablename__ = "app_subscriptions"
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"))
+    app_id = Column(Integer, ForeignKey("apps.id"))
+    tenant = relationship("Tenant", back_populates="apps")
+    app = relationship("App", back_populates="subscriptions")
+
+# Create all tables
+Base.metadata.create_all(bind=engine)
+
 # Dependency for getting the database session
 def get_db():
-    db = database.SessionLocal()
+    db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
-# Pydantic model for token data
+# Utility functions (e.g., sending emails)
+def send_registration_email(email: str, token: str):
+    # Implement your email sending logic here
+    print(f"Sending registration email to {email} with token {token}")
+
+# Pydantic models for request bodies
 class TokenData(BaseModel):
     email: str = None
+
+class AddUserRequest(BaseModel):
+    firstname: str
+    lastname: str
+    email: EmailStr
+    mobile_number: int
+
+class AddOrganisationRequest(BaseModel):
+    legalname: str
+    address: str
+    neighbourhood: str
+    city: str
+    province: str
+    country: str
+    postalcode: int
+    timezone: str
 
 # Microsoft authentication app configuration
 app_config = {
@@ -70,14 +173,81 @@ async def home():
         }
     }
 
+# Existing endpoints...
+
+# New endpoint: Add Users
+@app.post("/add-users")
+async def add_users(request: AddUserRequest, db: Session = Depends(get_db)):
+    try:
+        existing_user = db.query(User).filter(User.email == request.email).first()
+        if existing_user:
+            return {"status": False, "message": "User already exists"}
+
+        new_user = User(
+            first_name=request.firstname,
+            last_name=request.lastname,
+            email=request.email,
+            phone=str(request.mobile_number)
+        )
+        db.add(new_user)
+        db.commit()
+        db.refresh(new_user)
+        return {"status": True, "message": "User Added"}
+    except Exception as e:
+        print(f"Error adding user: {e}")
+        return {"status": False, "message": "User not Added"}
+
+# New endpoint: Add Organisation
+@app.post("/add-organisation")
+async def add_organisation(request: AddOrganisationRequest, db: Session = Depends(get_db)):
+    try:
+        valid_timezones = [
+            "Pacific/Midway", "Pacific/Pago_Pago", "Pacific/Honolulu",
+            "America/Anchorage", "America/Los_Angeles", "America/Denver",
+            "America/Chicago", "America/New_York", "America/Caracas",
+            "America/Halifax", "America/St_Johns", "America/Argentina/Buenos_Aires",
+            "America/Noronha", "Atlantic/Azores", "Europe/London", "Europe/Berlin",
+            "Africa/Johannesburg", "Asia/Baghdad", "Asia/Tehran", "Asia/Dubai",
+            "Asia/Kabul", "Asia/Karachi", "Asia/Kolkata", "Asia/Kathmandu",
+            "Asia/Dhaka", "Asia/Yangon", "Asia/Bangkok", "Asia/Shanghai",
+            "Australia/Eucla", "Asia/Tokyo", "Australia/Adelaide",
+            "Australia/Sydney", "Australia/Lord_Howe", "Asia/Magadan",
+            "Pacific/Norfolk", "Pacific/Auckland", "Pacific/Chatham",
+            "Pacific/Tongatapu", "Pacific/Kiritimati"
+        ]
+        if request.timezone not in valid_timezones:
+            return {"status": False, "message": "Invalid timezone"}
+
+        new_org = Organization(
+            legal_name=request.legalname,
+            address=request.address,
+            neighborhood=request.neighbourhood,
+            city=request.city,
+            state=request.province,  # Mapping 'province' to 'state' in the model
+            country=request.country,
+            postal_code=str(request.postalcode),
+            time_zone=request.timezone
+        )
+        db.add(new_org)
+        db.commit()
+        db.refresh(new_org)
+        return {"status": True, "message": "Organisation added..!"}
+    except Exception as e:
+        print(f"Error adding organisation: {e}")
+        return {"status": False, "message": "Organisation couldn't be added..!"}
+
+# Rest of your existing endpoints...
+
+# For demonstration purposes, here are some of the existing endpoints:
+
 @app.post("/email_login")
 async def send_email_login_link(email: str = Form(...), db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.email == email).first()
+    user = db.query(User).filter(User.email == email).first()
     registration_token = str(uuid.uuid4())
 
     if not user:
         # Send registration email to new user
-        utils.send_registration_email(email, registration_token)
+        send_registration_email(email, registration_token)
         return JSONResponse(content={"message": "Registration email sent", "status": "new_user"})
     else:
         # For existing user, update the registration token but do not send email
@@ -88,7 +258,7 @@ async def send_email_login_link(email: str = Form(...), db: Session = Depends(ge
 @app.get("/register")
 async def register_form(email: str, token: str, db: Session = Depends(get_db)):
     # Validate token and email
-    user = db.query(models.User).filter(models.User.email == email, models.User.registration_token == token).first()
+    user = db.query(User).filter(User.email == email, User.registration_token == token).first()
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invalid registration link")
 
@@ -111,102 +281,65 @@ async def register_form(email: str, token: str, db: Session = Depends(get_db)):
 async def register_user(
     email: str = Form(...),
     token: str = Form(...),
-    first_name: str = Form(...), 
-    last_name: str = Form(...), 
-    user_name: str = Form(...), 
-    phone: str = Form(...), 
-    time_zone: str = Form(...), 
+    first_name: str = Form(...),
+    last_name: str = Form(...),
+    user_name: str = Form(...),
+    phone: str = Form(...),
+    time_zone: str = Form(...),
     roles: str = Form(...),  # Expecting a comma-separated string of role names
-    scope: str = Form(...), 
-    about_us: str = Form(...), 
+    scope: str = Form(...),
+    about_us: str = Form(...),
     db: Session = Depends(get_db)
 ):
     # Verify user by email and token
-    user = db.query(models.User).filter(models.User.email == email, models.User.registration_token == token).first()
-    if user:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User already registered")
+    user = db.query(User).filter(User.email == email, User.registration_token == token).first()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid token or email")
 
-    # Create a new user
-    new_user = models.User(
-        email=email,
-        first_name=first_name,
-        last_name=last_name,
-        user_name=user_name,
-        phone=phone,
-        time_zone=time_zone,
-        scope=scope,
-        about_us=about_us,
-        is_active=True
-    )
+    # Update user details
+    user.first_name = first_name
+    user.last_name = last_name
+    user.user_name = user_name
+    user.phone = phone
+    user.time_zone = time_zone
+    user.scope = scope
+    user.about_us = about_us
+    user.is_active = True
+    user.registration_token = None  # Clear the token after registration
 
     # Assign new roles
     role_names = roles.split(',')
     for role_name in role_names:
-        role = db.query(models.Role).filter(models.Role.role_name == role_name.strip()).first()
+        role = db.query(Role).filter(Role.role_name == role_name.strip()).first()
         if role:
-            user_role = models.UserRole(user=new_user, role=role)
+            user_role = UserRole(user=user, role=role)
             db.add(user_role)
 
-    db.add(new_user)
     db.commit()
-    db.refresh(new_user)
+    db.refresh(user)
 
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_302_FOUND)
 
-@app.get("/login")
-async def microsoft_login():
-    auth_url = cca.get_authorization_request_url(SCOPES, redirect_uri=REDIRECT_URI)
-    return RedirectResponse(auth_url)
+@app.get("/dashboard")
+async def dashboard(db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)):
+    current_user = get_current_user(db, token)
+    if current_user.type == "Admin":
+        return {"msg": "Admin Dashboard", "data": admin_dashboard_data()}
+    elif current_user.type == "Tenant":
+        return {"msg": "Tenant Dashboard", "data": tenant_dashboard_data(current_user)}
+    elif current_user.type == "ActionUser":
+        return {"msg": "Action User Dashboard", "data": action_user_dashboard_data(current_user)}
+    else:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access forbidden")
 
-@app.get("/auth/callback")
-async def auth_callback(request: Request, db: Session = Depends(get_db)):
-    code = request.query_params.get("code")
-    result = cca.acquire_token_by_authorization_code(code, scopes=SCOPES, redirect_uri=REDIRECT_URI)
-    if "error" in result:
-        return JSONResponse(content=result, status_code=400)
-    email = result["id_token_claims"].get("preferred_username")
-    if not email:
-        return JSONResponse(content={"error": "Email not found in token"}, status_code=400)
-    user = db.query(models.User).filter(models.User.email == email).first()
-    if user:
-        return RedirectResponse(url="/dashboard", status_code=status.HTTP_302_FOUND)
-    registration_token = str(uuid.uuid4())
-    utils.send_registration_email(email, registration_token)
-    return JSONResponse(content={"message": "Registration email sent", "status": "new_user"})
+def admin_dashboard_data():
+    return {"organizations": [], "users": [], "apps": []}
 
-@app.get("/google/login")
-async def google_login():
-    google_auth_url = (
-        f"https://accounts.google.com/o/oauth2/auth?response_type=code"
-        f"&client_id={GOOGLE_CLIENT_ID}&redirect_uri={GOOGLE_REDIRECT_URI}&scope=openid%20email%20profile"
-    )
-    return RedirectResponse(url=google_auth_url)
+def tenant_dashboard_data(user):
+    return {"organizations": user.organizations, "users": user.users, "apps": user.apps}
 
-@app.get("/auth/google/callback")
-async def google_callback(request: Request, db: Session = Depends(get_db)):
-    code = request.query_params.get("code")
-    try:
-        token_request_uri = f"https://oauth2.googleapis.com/token"
-        token_data = {
-            'code': code,
-            'client_id': GOOGLE_CLIENT_ID,
-            'client_secret': GOOGLE_CLIENT_SECRET,
-            'redirect_uri': GOOGLE_REDIRECT_URI,
-            'grant_type': 'authorization_code'
-        }
-        token_response = external_requests.post(token_request_uri, data=token_data).json()
-        idinfo = id_token.verify_oauth2_token(token_response["id_token"], requests.Request(), GOOGLE_CLIENT_ID)
-        email = idinfo.get('email')
-        if not email:
-            return JSONResponse(content={"error": "Email not found in token"}, status_code=400)
-        user = db.query(models.User).filter(models.User.email == email).first()
-        if user:
-            return RedirectResponse(url="/dashboard", status_code=status.HTTP_302_FOUND)
-        registration_token = str(uuid.uuid4())
-        utils.send_registration_email(email, registration_token)
-        return JSONResponse(content={"message": "Registration email sent", "status": "new_user"})
-    except ValueError:
-        return JSONResponse(content={"error": "Invalid token"}, status_code=400)
+def action_user_dashboard_data(user):
+    return {"reviews": [], "apps": user.apps}
 
 def get_current_user(db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
@@ -221,7 +354,7 @@ def get_current_user(db: Session = Depends(get_db), token: str = Depends(oauth2_
             raise credentials_exception
     except JWTError:
         raise credentials_exception
-    user = db.query(models.User).filter(models.User.email == email).first()
+    user = db.query(User).filter(User.email == email).first()
     if user is None:
         raise credentials_exception
     return user
